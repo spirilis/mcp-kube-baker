@@ -359,3 +359,319 @@ context `linode`:
   returns the same text with `structuredContent` intact.
 
 Not committed to git — awaiting user review.
+
+## Phase 10 — plugin system + Karpenter plugin (2026-08-20)
+
+Plan reference: `~/.claude/plans/survey-this-project-and-snazzy-kahn.md`
+(approved 2026-08-20).
+
+- [x] `internal/tools/podlogs.go` — the log path split out for reuse:
+      `logWindow` + `resolveLogWindow`, `logFetch` + `fetchPodLogs`, `logText`.
+      `NewGetPodLogsHandler` now composes them; `podlogs_test.go` unchanged,
+      which is the proof the split changed no behaviour
+- [x] `internal/tools/plugins.go` — `Plugin`/`PluginSurface`/`PluginTool`/
+      `PluginResource`/`PluginTemplate`, `Catalog()`, `PluginManager`, and the
+      two always-on meta-tools with catalog-generated descriptions and enum
+- [x] `internal/tools/karpenter.go` — `kubectl_karpenter_logs`, plus
+      `findKarpenterLease`, `karpenterLeaderPod`, `leaseStaleness` and
+      `pickKarpenterContainer`
+- [x] `cmd/mcp-kube-baker/main.go` — one `tools.RegisterPlugins` call; no config
+      plumbing, since plugin state is runtime-only
+- [x] `internal/config/` — deliberately unchanged
+- [x] `internal/resources/` — deliberately unchanged; still 7 templates, though
+      a plugin may now add more
+- [x] Tests: `plugins_test.go` (17) + `karpenter_test.go` (42 incl. subtests)
+- [x] README — `## Plugins` + `### karpenter`, two rows in the tool table, and
+      the "All tools are read-only" claim qualified
+- [x] `PLAN.md` — the plugin system recorded as a capability
+
+### Design notes
+
+**The notification plumbing was already there, so none was written.**
+`mcp.ToolRegistry.Register`/`Unregister` fire the registry's `onChange`, which
+`mcp.NewServer` wires to the subscription broker; `tools/list` reads the registry
+live per request and `capabilities.tools.listChanged` is already advertised
+`true`. Enabling a plugin is a `Register` call and nothing else. The same holds
+for `ResourceRegistry`, which is why a plugin surface carries resources and
+templates as well as tools even though `karpenter` uses only the tools half — the
+capability is free, and a test-only plugin exercises the other two so they are not
+shipped untested.
+
+**Repeat calls must not re-register.** `Register` on a name already present
+replaces the entry, moves it to the end of the list, and fires another
+`list_changed`. So enabling an already-enabled plugin has to be a real no-op, not
+a harmless-looking second `Register`: otherwise every repeat call spams the
+client and churns the ordering the registry keeps stable for client and prompt
+caching. `TestPluginEnableIdempotentDoesNotReRegister` detects the mistake by
+watching list *position*, which is the only observable trace of it without a live
+broker — and the manual pass below confirmed it on the wire: two enables, one
+notification.
+
+**Descriptions are generated once and never regenerated.** Rendering live
+"(enabled)" state into them would mean re-`Register`ing the meta-tools on every
+toggle, which is exactly the spurious notification above. Current state travels
+in the *result* instead — every action returns the status of every plugin — which
+is also why there is no `kubectl_plugin_list`: `tools/list` is the list, and the
+action results cover what it cannot say.
+
+**Enable rolls back.** `RegisterTemplate` is the one registration call that can
+fail (a URI template is compiled up front), so a surface whose template is
+malformed would otherwise leave a plugin half-enabled. It undoes what it already
+registered and reports the error. `TestCatalogSurfacesRegisterCleanly` makes that
+path unreachable for shipped plugins by registering every catalog entry.
+
+**Not a spec violation.** 2026-07-28 says a tool set must not vary per-connection
+or as a side effect of another request — but the library's own design note states
+the carve-out inline: *"registry mutation by the embedder is fine — that's what
+`list_changed` is for"*. The rule targets *hidden* variation. No ordinary tool
+here touches the registry; only the two dedicated, model-visible meta-tools do.
+
+**Plugin state is per process, not per client.** One registry per process means
+that under the HTTP transport one client's enable changes every client's tool
+list. Correct for stdio, where each client gets its own process, and documented
+in the README rather than papered over with faked session state — `mcp.Server` is
+deliberately stateless and offers no per-principal registry to partition.
+
+**The Karpenter leader is found, not guessed.** The `karpenter-leader-election`
+Lease's `holderIdentity` is controller-runtime's `hostname + "_" + uuid`, and a
+pod's hostname is its name; `_` is not legal in a pod name, so the first one is an
+unambiguous split. An identity with no `_` is used whole rather than rejected —
+if it is not a pod name, the pod lookup says so more usefully than a parse error
+would. Three fallbacks make the tool work on installs that differ from the
+default: a Lease whose *name* merely mentions karpenter (reported back, so a
+fuzzy match is never silent), a cluster-wide search when the Lease's namespace is
+not the pod's, and a container named `controller` preferred over any sidecar.
+
+**An expired Lease returns logs anyway.** Reporting `stale: true` with a banner
+beats erroring: a Karpenter that stopped renewing leadership is usually the thing
+being investigated, and its last log lines are why. A Lease with no `renewTime`
+or `leaseDurationSeconds` reports "freshness unknown" rather than implying it is
+current.
+
+**The all-namespaces fallback re-checks the name client-side.** The field
+selector is applied by the API server; `client-go`'s fake `List` honours only the
+*label* selector and silently drops the field one. Trusting the selector would
+work in production and hand back an arbitrary pod in every test — so the name is
+verified on the returned items, which is also the honest thing to do against any
+implementation that ignores the selector.
+
+**`tail_lines` alone is how you ask for everything.** The plan's brief said an
+omitted `tail_lines` should dump the whole log, which on a Karpenter that logs
+megabytes a day is the opposite of what a context-management feature should do.
+The window contract is therefore identical to `kubectl_get_pod_logs`: no bounds
+means the last 256 KiB with a `[truncated: …]` banner, and `tail_lines` alone
+applies no byte cap at all.
+
+### Verification
+
+`gofmt -l .` clean, `go build ./...`, `go vet ./...`, `go test ./...` all pass.
+`internal/tools/podlogs_test.go` passes **unchanged**, which is what makes the
+log-path extraction safe. 59 tests/subtests across the two new test files.
+
+Manual pass over stdio against a throwaway kubeconfig (one unreachable context),
+driving raw JSON-RPC:
+
+- Legacy handshake (`initialize` → 2025-06-18) then `tools/list` → **12 tools**,
+  the 10 originals plus `kubectl_plugin_enable`/`kubectl_plugin_disable`. No
+  `kubectl_karpenter_logs`.
+- Both meta-tool descriptions carry the catalog as intended, one line per plugin
+  ending in "Adds tools: kubectl_karpenter_logs.", with
+  `plugin_name.enum == ["karpenter"]` and annotations
+  `{destructiveHint: false, idempotentHint: true}` — no `readOnlyHint`.
+- Modern (2026-07-28) with an open `subscriptions/listen`:
+  `notifications/subscriptions/acknowledged`, then
+  `kubectl_plugin_enable(karpenter)` → `action: enabled` **and one
+  `notifications/tools/list_changed`** → `tools/list` = **13 tools** including
+  `kubectl_karpenter_logs`; `kubectl_plugin_disable(karpenter)` →
+  `action: disabled`, a second `list_changed`, `tools/list` back to **12**.
+- A second `kubectl_plugin_enable(karpenter)` → `action: already_enabled` and
+  **no** notification. Two enables, one notification total: the idempotency
+  property confirmed on the wire, not just in a unit test.
+- `kubectl_plugin_enable(nope)` → recoverable tool error:
+  `unknown plugin "nope"; the available plugins are: karpenter`.
+- `kubectl_karpenter_logs` against the unreachable cluster → recoverable tool
+  error naming the Lease it went looking for, not a crash and not a JSON-RPC
+  protocol error.
+
+**Not verified against a live Karpenter.** Every context in this environment's
+kubeconfig returns "You must be logged in to the server", so the exact
+`karpenter-leader-election` name and the holder→pod resolution are covered by
+fake-clientset fixtures only. Before treating any live failure as a bug, confirm
+the cluster actually runs Karpenter:
+
+```bash
+kubectl --context <ctx> -n kube-system get leases | grep -i karpenter
+```
+
+No match means the tool's "does not appear to be installed" error is the correct
+result, and the only thing to check is that the message is that clear one.
+
+Committed and released in tag `0.2.0` alongside Phase 11.
+
+## Phase 11 — skills extension, always-on + plugin-scoped (2026-08-20)
+
+Plan reference:
+`~/.claude/plans/pull-generic-go-mcp-v0-8-0-and-distributed-petal.md`
+(approved 2026-08-20).
+
+- [x] `go.mod` — `generic-go-mcp` v0.7.0 → **v0.8.0**. Only the `require` line
+      moved; no new dependencies, since `mcp`'s new `gopkg.in/yaml.v3` import was
+      already direct here via `internal/config`
+- [x] `internal/skills/skills.go` — new package owning `URIPrefix` (`skill://`)
+      and every loading operation: `ContentFS`, `Load`, `URIsIn`, `RegisterAll`
+- [x] `internal/skills/content/pod-triage/` — `SKILL.md` (6 steps against the
+      real tools) + `references/failure-modes.md` (symptom → next-step table)
+- [x] `internal/tools/skills/karpenter/karpenter-nodes/SKILL.md` — the
+      plugin-scoped skill, embedded in `internal/tools` beside its plugin
+- [x] `internal/tools/plugins.go` — `PluginSurface.Skills fs.FS`;
+      `PluginManager.skills`; `pluginState.skillURIs`; `newPluginManager` /
+      `NewPluginManager` / `RegisterPlugins` now return an `error`;
+      `registerSurfaceLocked` takes `*pluginState` and loads skills last;
+      `unregisterSurfaceLocked` takes the URIs; `pluginStatusRow.Skills`;
+      `catalogText` advertises skills; both meta-tool descriptions updated
+- [x] `internal/config/config.go` — `SkillsConfig{Enabled *bool}` +
+      `(*Config).SkillsEnabled()`, defaulting **on**
+- [x] `cmd/mcp-kube-baker/main.go` — skill registry built before the plugin
+      manager and handed to it; `ServerConfig.Skills` /
+      `SkillsDirectoryRead`; `serverInstructions` mentions `skills/list`
+- [x] Tests — `internal/skills/skills_test.go` (5 tests, external test package);
+      5 new plugin-skill tests in `internal/tools/plugins_test.go`; 2 new config
+      tests; the 15 existing `newTestPluginManager` call sites updated
+- [x] Docs — README `## Skills (experimental)` + Plugins/karpenter/Configuration
+      updates, `config.yaml`, `config-http.yaml`, `PLAN.md`
+
+### Design notes
+
+**Why `fs.FS` on the plugin surface, not `[]mcp.SkillDef`.** Building `SkillDef`s
+by hand would mean reimplementing the library's walk rules, frontmatter parsing
+and URI escaping — three more things to drift. The surface carries the
+filesystem; the library stays the only implementation of itself.
+
+**Why `URIsIn` loads into a throwaway registry.** `LoadFS` returns only `error`,
+so it never says which URIs it created — and `disable` needs exactly those.
+Recomputing them from directory names would be the "second derivation path to
+drift" the existing `PluginManager` comment warns against, so instead the
+plugin's tree is loaded into a scratch registry at construction and the URIs read
+back from it. That also moves validation to startup, where it belongs: embedded
+content can only be wrong by build defect, so failing at a client's first
+`enable` call would be the wrong time and the wrong audience. Hence the new
+`error` return on `newPluginManager`.
+
+**Why fail hard on a load error.** `resources.RegisterAll` already exits, and
+skills are a stronger case: a kubeconfig or a template is validated against
+environment-dependent input, but `go:embed`-ded content is fixed at build time.
+A `LoadFS` failure is a shipping mistake, and startup is when to say so.
+
+**Why `skills.enabled` defaults on, via `*bool`.** An omitted field has to be
+distinguishable from an explicit `false` — the same reason
+`kubectl_get_pod_logs` takes `*bool` for `timestamps`. `SkillsEnabled()` is a
+method rather than an inline check so the default-on rule has one spelling.
+Off means the extension is *absent*, not empty: nil registry, no capability key,
+three `-32601`s, no `skill://` resource registered at all. Turning skills off
+does not turn plugins off.
+
+**Why skills are not gated the way plugin tools are.** `plugins.go` states the
+reason plugins exist: a tool's schema sits in the model's context all session. A
+skill's body is never loaded until a host calls `skills/get`; `skills/list`
+carries only frontmatter and digests. So there is no context-budget argument for
+hiding a skill, and the always-on set is always on. Plugin-scoped skills exist
+for *relevance* instead — a Karpenter procedure is noise on a cluster without
+Karpenter — and reading better when they can assume the plugin is enabled, since
+discovery is `kubectl_plugin_enable`'s job: its description already carries the
+catalog. That is what dissolves the circularity a plugin-gated
+"enable this plugin" skill would have.
+
+**`skill://` rather than `mcp+kubectl://`.** SEP-2640 makes the scheme a SHOULD.
+Taken anyway, so a skills-aware host recognizes it, and because it separates
+static documentation from live cluster objects in `resources/list` — which they
+share by design, since one registry is exactly what makes `skills/list` and
+`resources/read` incapable of disagreeing about a skill's contents.
+
+**The missing notification, stated rather than papered over.** SEP-2640 defines
+no `skills/list_changed` and the library deliberately did not invent one. A
+skill's files are ordinary resources, so publishing one fires
+`resources/list_changed` — but nothing tells a client that `skills/list` itself
+changed. `pluginStatusRow.Skills` names the URIs in the action result, the only
+in-band signal available.
+
+**A footgun the library cannot catch.** Registering a skill under a URI another
+skill already holds is *replacement*, not conflict. Two plugins — or a plugin and
+the always-on set — sharing a skill directory name would silently shadow each
+other, and disabling one would withdraw the other's content.
+`TestSkillURIsAreUniqueAcrossTiers` guards it. Relatedly, `PluginTemplate`'s doc
+comment gained the rule that a plugin must never claim a `skill://` URI directly,
+since `SkillRegistry` only detects conflicts between skills.
+
+**The doc-rot guard is the load-bearing test.** A skill's whole value is naming
+this server's real tools, arguments and URIs — and prose does not compile, so a
+rename would leave the skills confidently wrong with nothing objecting.
+`TestSkillContentReferencesRealToolsAndResources` extracts every `kubectl_*`
+identifier and every `mcp+kubectl://` URI from every shipped skill, both tiers,
+and resolves them against a live `ToolRegistry` and `ResourceRegistry`. The URI
+half works because the skills write URIs in the same `{context}` placeholder
+style the tool descriptions use: `MatchTemplate` matches structurally on segment
+count and literal segments, so the literal text `{context}` binds to the
+`{context}` variable. `tools.RegisterAll`, `resources.RegisterAll` and
+`Plugin.Surface` only close over their `kube.Clients`, never calling it at
+registration time, so a nil client source suffices and no fake is needed.
+`internal/skills`' tests are in `package skills_test` out of necessity, not
+style: `internal/tools` imports `internal/skills`, and only an external test
+package may import back.
+
+### Verification
+
+- `gofmt -l .` clean; `go build ./...`, `go vet ./...`, `go test ./...` and
+  `go test -race ./...` all pass. No existing test needed a behavioural change —
+  only the mechanical `newTestPluginManager` signature update.
+- **The doc-rot guard was proven to fail before being trusted.** Misspelling
+  `kubectl_get_pod_logs` in `pod-triage/SKILL.md` and changing
+  `mcp+kubectl://{context}/node/{node}` to `.../nodes/{node}` in
+  `karpenter-nodes/SKILL.md` produced exactly the expected failures in both
+  subtests, naming file, identifier and reason. Reverted and re-run with
+  `-count=1` to confirm clean.
+- Modern (2026-07-28) over stdio: `server/discover` reports
+  `extensions: {"io.modelcontextprotocol/skills": {"directoryRead": true}}`;
+  `skills/list` returns one entry (`skill://pod-triage/SKILL.md`,
+  `frontmatter.name: pod-triage`, two `sha256:` resources) with
+  `resultType: complete, ttlMs: 300000, cacheScope: public`; `skills/get`
+  nests the same entry under `skill`; `resources/directory/read` on
+  `skill://pod-triage` lists `SKILL.md` (`text/markdown`) and `references`
+  (`inode/directory`); a bogus URI answers `-32602 Unknown skill`.
+- **The digest ↔ `resources/read` invariant confirmed on the wire**, for both
+  the always-on and the plugin skill: hashing the bytes `resources/read`
+  returned reproduces the digest `skills/list` published.
+- **Plugin skill lifecycle on the wire**: `kubectl_plugin_enable(karpenter)` →
+  `tools/list` 12→13, `skills/list` 1→2 including
+  `skill://karpenter-nodes/SKILL.md`, and the result's `skills` field names that
+  URI. `kubectl_plugin_disable(karpenter)` → back to 12 and 1, with both
+  `skills/get` and `resources/read` on the withdrawn URI answering `-32602`.
+- **Notifications, with an open `subscriptions/listen`** (filter
+  `{toolsListChanged, resourcesListChanged}`): enable emits exactly one
+  `tools/list_changed` and one `resources/list_changed` — one per skill, not one
+  per file. A repeat enable → `already_enabled` and **no** notification. Disable
+  emits one of each, in the reverse order `unregisterSurfaceLocked` unwinds.
+- **Off-switch** (`skills: {enabled: false}`): `server/discover` capabilities are
+  `[completions, resources, tools]` with no `extensions` key; all three methods
+  answer `-32601 Method not found`; no `skill://` URI in `resources/list`; and
+  `kubectl_plugin_enable(karpenter)` still moves `tools/list` to 13 while
+  advertising no skills — including in the meta-tool description, which omits
+  "Adds skills:" entirely rather than promising prose the server will not serve.
+- **Legacy compat**: a `2025-06-18` `initialize` carries
+  `capabilities.extensions` with the skills key; `skills/list`, `skills/get` and
+  `resources/directory/read` are all forwarded, `frontmatter` and every
+  `sha256:` digest intact, with `resultType`/`ttlMs` stripped by the downgrade
+  as expected.
+- The generated catalog line now reads, in both meta-tool descriptions:
+  `- karpenter: Karpenter node autoscaler: ... Adds tools:
+  kubectl_karpenter_logs. Adds skills: skill://karpenter-nodes/SKILL.md.`
+  — asserted in `TestPluginDescriptionsListCatalog`, and still stable across a
+  toggle (`TestPluginDescriptionsAreStableAcrossEnableDisable`), since
+  `skillURIs` is fixed at construction.
+
+One caveat carried forward from Phase 10, unchanged: the `karpenter` plugin's
+*tool* is still unverified against a live Karpenter install. The
+`karpenter-nodes` skill describes that tool's contract, so if the live contract
+ever turns out to differ, the skill is a second place to correct.
+
+Committed and released in tag `0.2.0` alongside Phase 10, which had been
+awaiting review in the same working tree.

@@ -31,8 +31,11 @@ Kubeconfig precedence: `--kubeconfig` flag > `kubeconfig:` in the config file
 
 ## Tools
 
-All tools are read-only. Every tool except `kubectl_get_contexts` takes a
-`context` argument naming the kubeconfig context (cluster) to query.
+Every tool that touches a cluster is read-only, and every one except
+`kubectl_get_contexts` takes a `context` argument naming the kubeconfig context
+(cluster) to query. The two `kubectl_plugin_*` tools below are the one exception
+to "read-only": they touch no cluster, but they do change which tools this server
+serves — see [Plugins](#plugins).
 
 | Tool | Arguments | Returns |
 |---|---|---|
@@ -46,6 +49,8 @@ All tools are read-only. Every tool except `kubectl_get_contexts` takes a
 | `kubectl_get_api_resources` | `context` | per Kind: name (plural), kind, api_group, short_names, versions, preferred_version, namespaced, verbs — CRDs included |
 | `kubectl_get_helm_installs` | `context`, `namespace?` | per Helm release: namespace, name, revision, status, chart, chart_version, app_version, updated, description, storage |
 | `kubectl_get_arbitrary_manifest` | `context`, `api_group?`, `api_version`, `kind`, `name`, `namespace?` | the object's full JSON manifest, plus what the Kind resolved to |
+| `kubectl_plugin_enable` | `plugin_name` | exposes that plugin's tools; returns the state of every plugin |
+| `kubectl_plugin_disable` | `plugin_name` | withdraws them again; returns the state of every plugin |
 
 ### Log windows
 
@@ -72,6 +77,80 @@ in its first line and sets `truncated` in `structuredContent`.
 Omitting the optional namespace argument(s) queries all namespaces. Results
 carry both a JSON text block and `structuredContent`, plus `resource_link`
 entries (capped at 100) pointing at the full manifests below.
+
+## Plugins
+
+Every tool definition a server advertises sits in the model's context for the
+whole session, so tools for add-ons a given cluster may not even run are a
+standing cost. Plugins move that cost behind a switch: a plugin's tools stay out
+of `tools/list` until a client asks for them.
+
+```
+kubectl_plugin_enable(plugin_name)    → the plugin's tools appear
+kubectl_plugin_disable(plugin_name)   → they go away again
+```
+
+Both tools' *descriptions* carry the full catalog — name, what it is, and exactly
+what enabling it adds — so discovery costs a few lines rather than every plugin's
+schemas. `plugin_name` is a schema `enum` generated from that same catalog, and
+every call returns the state of all plugins, so there is no third tool to ask
+"what's on?".
+
+Enabling or disabling registers or unregisters against the live registry, which
+makes the server send `notifications/tools/list_changed` (over
+`subscriptions/listen` for 2026-07-28 clients, in the classic push shape for
+legacy-compat sessions). Repeating a call is a deliberate no-op: it neither
+re-registers nor re-notifies.
+
+| Plugin | Adds | Needs |
+|---|---|---|
+| `karpenter` | `kubectl_karpenter_logs`, `skill://karpenter-nodes/SKILL.md` | Karpenter installed, and `get`/`list` on `coordination.k8s.io/v1` leases |
+
+Nothing is enabled at startup. Plugin state is runtime-only — there is no config
+key and no state file, so every process starts clean.
+
+Two things to know:
+
+- **State is per process, not per client.** Under the HTTP transport every
+  connection shares one registry, so one client enabling `karpenter` makes its
+  tools appear for all of them. That is correct for stdio, where a client gets
+  its own process, and it is the intended model there.
+- **A plugin may also contribute resources, resource templates, and skills**, not
+  just tools; the registry and its `resources/list_changed` notification are
+  symmetric with the tool side. `karpenter` contributes a tool and a skill.
+  Skills are the one asymmetric case, because the extension defines no
+  skills-changed notification — see [Skills](#skills-experimental). With
+  `skills.enabled: false` a plugin's tools still come and go as normal; only its
+  skills are absent, and it advertises none.
+
+### karpenter
+
+`kubectl_karpenter_logs(context, namespace?, container?, previous?, tail_lines?,
+max_size_kib?, timestamps?)` returns the logs of the Karpenter replica that
+*currently holds leadership* — the only one doing any provisioning, and so the
+only one whose logs explain why nodes are or are not appearing.
+
+It finds that pod rather than asking for it: read the `karpenter-leader-election`
+Lease in `kube-system` (override with `namespace`; a renamed or forked install is
+matched by any Lease there whose name mentions karpenter, and the one used is
+reported back), take its `holderIdentity` — controller-runtime writes
+`<pod-name>_<uuid>` — and resolve that to a pod, falling back to a cluster-wide
+search by name for installs whose Lease and pods live in different namespaces.
+The container defaults to `controller` when present, else the pod's only one.
+
+If the Lease has expired the logs are still returned, with `stale: true`, a reason,
+and a leading banner: a Karpenter that stopped renewing leadership is usually
+exactly what you are looking into. The window arguments behave identically to
+[`kubectl_get_pod_logs`](#log-windows).
+
+**A "does not appear to be installed" result is not a bug.** The tool starts from
+the leader-election Lease, so a cluster without Karpenter correctly reports that
+there is none.
+
+Enabling the plugin also publishes `skill://karpenter-nodes/SKILL.md`, the
+procedure for using this tool: what the staleness banner means, and how to tell
+"Karpenter never saw the pod" from "the cloud provider refused" from "the node
+never joined" — three failures that look identical from a Pending pod's side.
 
 ## Resources (templates)
 
@@ -108,6 +187,57 @@ supported for the `{context}` variable (kubeconfig context names), for
 `{apiGroup}`/`{version}`/`{kind}` from cluster discovery, and for `{release}`
 once a context and namespace are resolved; object names are an unbounded
 keyspace and return no completions.
+
+## Skills (experimental)
+
+Troubleshooting procedures are shipped as embedded [Agent
+Skills](https://agentskills.io/specification), served over the
+`io.modelcontextprotocol/skills` MCP extension: `skills/list`, `skills/get`, and
+`resources/directory/read`. The point of serving a skill over MCP rather than
+writing a runbook is that these procedures name *this server's* tools, arguments
+and resource URIs — generic `kubectl` advice names commands a read-only server
+cannot execute.
+
+| Skill | Available | Covers |
+|---|---|---|
+| `skill://pod-triage/SKILL.md` | always | A pod not Running or not Ready: `kubectl_get_pods` → the pod manifest resource → `kubectl_get_pod_logs` with `previous: true` → `kubectl_get_events`. Bundles `references/failure-modes.md`, a symptom → next-step table for `CrashLoopBackOff`, `OOMKilled`, `Pending`/`FailedScheduling`, `Init:Error` and the rest. |
+| `skill://karpenter-nodes/SKILL.md` | while the `karpenter` plugin is enabled | Karpenter node provisioning: reading the leader's logs through `kubectl_karpenter_logs`, what the staleness banner means, and telling a NodePool misconfiguration from a capacity shortfall. |
+
+A skill's files are registered as **ordinary resources** on the same registry the
+`mcp+kubectl://` templates live on, so `resources/read` can serve exactly the
+bytes `skills/list` published a `sha256:` digest for — the two can never disagree
+about what a skill contains. They are distinguished from live cluster data only
+by scheme, which is intended.
+
+`resources/directory/read` is enabled, so a client can list `skill://pod-triage`
+to discover its bundled references instead of parsing them out of the listing.
+Nothing else becomes visible through it: it walks only registered concrete
+resources, and every cluster-data resource here is a template.
+
+Plugin-scoped skills come and go with their plugin, which is the one wrinkle
+worth knowing about. Enabling a plugin publishes its skill and fires
+`notifications/resources/list_changed` (a skill's files being resources), but the
+extension defines **no** skills-changed notification — so a client holding a
+cached `skills/list` is not told to refetch it. The `kubectl_plugin_enable`
+result therefore names the skill URIs it published; re-read `skills/list` after a
+toggle.
+
+Skills are on by default and can be turned off with `skills.enabled: false`,
+which makes the extension absent rather than empty: no capability key, and all
+three methods answer `-32601`. **Turning skills off does not turn plugins off** —
+a plugin still contributes its tools, and simply advertises no skills.
+
+> **Experimental.** This implements
+> [SEP-2640](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640),
+> an MCP Extensions Track proposal that is **open and not merged**. Nothing about
+> skills appears in the ratified 2026-07-28 specification, and no public MCP
+> client consumes it yet. It ships anyway because it is purely additive and
+> invisible to any client that does not ask: a server with skills off is
+> byte-for-byte the old one, and — unlike a tool's schema, which sits in the
+> model's context all session — a skill's body is never loaded until a host
+> explicitly calls `skills/get`. A breaking revision of the SEP would be a
+> breaking change to a feature nobody was required to adopt. Requires
+> `generic-go-mcp` v0.8.0 or later.
 
 ## Helm
 
@@ -168,6 +298,8 @@ server:
     session_ttl: 30m
 auth:                                 # GitHub OAuth, http mode only
   enabled: false
+skills:                               # experimental skills extension (SEP-2640)
+  enabled: true                       # default; false hides the extension entirely
 logging:
   level: info                         # info | debug | trace
   format: text                        # text | json
@@ -175,7 +307,8 @@ logging:
 
 See `config.yaml` (stdio) and `config-http.yaml` (HTTP + OAuth + legacy
 compat) for complete annotated examples. The `server`, `auth`, and `logging`
-sections are the generic-go-mcp library's own config schema.
+sections are the generic-go-mcp library's own config schema; `kubeconfig` and
+`skills` are this server's own.
 
 Notes:
 
@@ -183,7 +316,14 @@ Notes:
   responses are marked `cacheScope: private` automatically.
 - **Legacy compat** wraps the server in generic-go-mcp's `compat.Overlay`,
   restoring the `initialize` handshake and (on HTTP) `Mcp-Session-Id`
-  sessions for 2025-11-25-and-earlier clients.
+  sessions for 2025-11-25-and-earlier clients. The skills extension is
+  forwarded to those clients too — the capability appears in the `initialize`
+  result and frontmatter and digests survive the result downgrade — on the
+  reasoning that a legacy client which understands it can use it, and one that
+  does not ignores an unknown capability key.
+- **Skills** are embedded at build time, so this knob only chooses whether to
+  serve them; there is nothing to point at a directory. See
+  [Skills](#skills-experimental).
 - On the 2026-07-28 protocol, every request must carry
   `params._meta["io.modelcontextprotocol/protocolVersion"]` and
   `.../clientCapabilities`; HTTP requests additionally need the

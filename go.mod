@@ -3,7 +3,7 @@ module github.com/spirilis/mcp-kube-baker
 go 1.26.2
 
 require (
-	github.com/spirilis/generic-go-mcp v0.7.0
+	github.com/spirilis/generic-go-mcp v0.8.0
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.36.3
 	k8s.io/apimachinery v0.36.3

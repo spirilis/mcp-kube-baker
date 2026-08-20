@@ -29,6 +29,13 @@ server:
 #  allowlist:
 #    users: ["your-github-login"]
 
+# Experimental skills extension (SEP-2640). On by default; omitting this section
+# means the same as enabled: true. Uncomment to hide the extension entirely —
+# no capability key, and skills/list, skills/get and resources/directory/read
+# all answer -32601. Plugins keep working either way, minus their skills.
+#skills:
+#  enabled: false
+
 logging:
   level: info
   format: text

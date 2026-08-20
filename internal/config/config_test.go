@@ -110,3 +110,48 @@ func TestLoadFromBytesAllowsOmittedKubeconfig(t *testing.T) {
 		t.Errorf("Kubeconfig = %q, want empty", cfg.Kubeconfig)
 	}
 }
+
+// TestSkillsEnabledDefaultsOn pins the default-on rule from every direction a
+// config file can express it. Getting this backwards would silently withdraw a
+// capability from every deployment that never mentioned skills.
+func TestSkillsEnabledDefaultsOn(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{"section omitted", "server:\n  mode: stdio\n", true},
+		{"section empty", "server:\n  mode: stdio\nskills: {}\n", true},
+		{"enabled omitted", "server:\n  mode: stdio\nskills:\n  {}\n", true},
+		{"explicitly true", "server:\n  mode: stdio\nskills:\n  enabled: true\n", true},
+		{"explicitly false", "server:\n  mode: stdio\nskills:\n  enabled: false\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := LoadFromBytes([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("LoadFromBytes: %v", err)
+			}
+			if got := cfg.SkillsEnabled(); got != tc.want {
+				t.Errorf("SkillsEnabled() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDefaultServesSkills covers the zero-config launch, which never sees a
+// skills: section at all.
+func TestDefaultServesSkills(t *testing.T) {
+	dir := t.TempDir()
+	writeKubeconfig(t, dir, ".kube/config")
+	t.Setenv("KUBECONFIG", "")
+	t.Setenv("HOME", dir)
+
+	cfg, err := Default()
+	if err != nil {
+		t.Fatalf("Default: %v", err)
+	}
+	if !cfg.SkillsEnabled() {
+		t.Error("a zero-config launch should serve skills")
+	}
+}

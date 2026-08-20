@@ -12,6 +12,15 @@ kubeconfig: /home/user/.kube/config
 server:
   mode: stdio
 
+# Experimental skills extension (SEP-2640): serves the embedded troubleshooting
+# procedures over skills/list, skills/get and resources/directory/read. On by
+# default — omitting this section entirely means the same as enabled: true.
+# false makes the extension absent rather than empty: no capability is declared
+# and all three methods answer -32601. Plugins are unaffected either way; one
+# still contributes its tools, just not its skills.
+skills:
+  enabled: true
+
 logging:
   level: info    # info | debug | trace
   format: text   # text | json

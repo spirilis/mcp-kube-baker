@@ -21,18 +21,21 @@ import (
 	"github.com/spirilis/mcp-kube-baker/internal/config"
 	"github.com/spirilis/mcp-kube-baker/internal/kube"
 	"github.com/spirilis/mcp-kube-baker/internal/resources"
+	"github.com/spirilis/mcp-kube-baker/internal/skills"
 	"github.com/spirilis/mcp-kube-baker/internal/tools"
 )
 
 const (
 	serverName    = "mcp-kube-baker"
-	serverVersion = "0.1.0"
+	serverVersion = "0.2.0"
 
 	serverInstructions = "Read-only access to one or more Kubernetes clusters, each named by a " +
 		"kubeconfig context. Start with kubectl_get_contexts to learn the cluster names; every " +
 		"other tool takes one as its context argument. Full object manifests are served as " +
 		"resources under mcp+kubectl://{context}/... — tool results include resource_link entries " +
-		"pointing at them."
+		"pointing at them. Hosts supporting the experimental io.modelcontextprotocol/skills " +
+		"extension can call skills/list for troubleshooting procedures written against these " +
+		"tools."
 )
 
 func main() {
@@ -98,6 +101,30 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Skills are embedded and immutable per build, so a load failure can only
+	// mean this binary shipped malformed content — never anything about this
+	// cluster or environment. Fail loudly, exactly as the resource templates
+	// above do. Disabled means never loading them at all, so their files stay
+	// out of resources/list too, and the extension is absent rather than empty.
+	var skillRegistry *mcp.SkillRegistry
+	if cfg.SkillsEnabled() {
+		if skillRegistry, err = skills.RegisterAll(resourceRegistry); err != nil {
+			logging.Error("Error registering skills", "error", err)
+			os.Exit(1)
+		}
+		logging.Info("Skills registered", "count", len(skillRegistry.List()), "prefix", skills.URIPrefix)
+	}
+
+	// Plugins add the two meta-tools now, and their own tools and skills only
+	// when a client enables one. Registering here, before NewServer wires the
+	// registries to the notification broker, means startup itself announces
+	// nothing. A nil skillRegistry leaves a plugin's tools intact and only its
+	// skills unpublished.
+	if _, err = tools.RegisterPlugins(registry, resourceRegistry, skillRegistry, clients); err != nil {
+		logging.Error("Error registering plugins", "error", err)
+		os.Exit(1)
+	}
+
 	authEnabled := cfg.Auth != nil && cfg.Auth.Enabled
 	legacyCompatEnabled := cfg.Server.LegacyCompat != nil && cfg.Server.LegacyCompat.Enabled
 
@@ -113,6 +140,17 @@ func main() {
 		Version:            serverVersion,
 		Instructions:       serverInstructions,
 		AdvertisedVersions: advertisedVersions,
+		// A nil registry is the documented off switch: no capability key, and
+		// skills/list, skills/get and resources/directory/read all answer
+		// -32601. Unlike the AuthService field below, this is a concrete
+		// pointer type rather than an interface, so assigning nil is safe.
+		Skills: skillRegistry,
+		// Lets a client list skill://<name> to find a skill's bundled
+		// references instead of parsing them out of the skills/list entry.
+		// Nothing else is exposed: DirectoryChildren walks only registered
+		// concrete resources, and every cluster-data resource here is a
+		// template.
+		SkillsDirectoryRead: skillRegistry != nil,
 	}
 	if authEnabled {
 		// Catalog and resource content reflect what the caller is authorized

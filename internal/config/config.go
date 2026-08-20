@@ -22,6 +22,27 @@ type Config struct {
 	Server  libconfig.ServerConfig   `yaml:"server"`
 	Auth    *libconfig.AuthConfig    `yaml:"auth,omitempty"`
 	Logging *libconfig.LoggingConfig `yaml:"logging,omitempty"`
+	Skills  *SkillsConfig            `yaml:"skills,omitempty"`
+}
+
+// SkillsConfig controls the experimental skills extension (SEP-2640).
+type SkillsConfig struct {
+	// Enabled serves the embedded skills, including any a plugin contributes.
+	//
+	// A pointer because the default is on: an omitted field has to be
+	// distinguishable from an explicit false, the same reason
+	// kubectl_get_pod_logs takes *bool for its timestamps argument. Setting it
+	// false makes the extension invisible rather than empty — no capability
+	// key, all three skill methods answer -32601, and no skill:// URI is
+	// registered at all. Plugins are unaffected either way.
+	Enabled *bool `yaml:"enabled"`
+}
+
+// SkillsEnabled reports whether to serve skills, defaulting to true. A method
+// rather than an inline check at the one call site, so the default-on rule has
+// exactly one spelling.
+func (c *Config) SkillsEnabled() bool {
+	return c.Skills == nil || c.Skills.Enabled == nil || *c.Skills.Enabled
 }
 
 // Load reads and validates the configuration file at path.

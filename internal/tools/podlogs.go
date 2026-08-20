@@ -107,27 +107,13 @@ func NewGetPodLogsHandler(c kube.Clients) mcp.ToolFunction {
 		if args.Namespace == "" || args.Pod == "" {
 			return mcp.ErrorResultf("the namespace and pod arguments are both required: use kubectl_get_pods to list pods"), nil
 		}
-		if args.TailLines != nil && *args.TailLines < 1 {
-			return mcp.ErrorResultf("tail_lines must be at least 1, got %d: omit it for the whole retained log", *args.TailLines), nil
-		}
-		if args.MaxSizeKiB != nil && (*args.MaxSizeKiB < 1 || *args.MaxSizeKiB > maxMaxSizeKiB) {
-			return mcp.ErrorResultf("max_size_kib must be between 1 and %d, got %d", maxMaxSizeKiB, *args.MaxSizeKiB), nil
+		window, errResult := resolveLogWindow(args.TailLines, args.MaxSizeKiB, args.Previous, args.Timestamps)
+		if errResult != nil {
+			return errResult, nil
 		}
 		cs, errResult := clientFor(c, args.Context)
 		if errResult != nil {
 			return errResult, nil
-		}
-
-		// Neither bound given: fall back to the 256 KiB tail rather than
-		// handing back a whole log of unknown size.
-		maxSizeKiB := args.MaxSizeKiB
-		if maxSizeKiB == nil && args.TailLines == nil {
-			d := defaultMaxSizeKiB
-			maxSizeKiB = &d
-		}
-		timestamps := true
-		if args.Timestamps != nil {
-			timestamps = *args.Timestamps
 		}
 
 		ctx, cancel := apiCtx(ctx)
@@ -138,68 +124,140 @@ func NewGetPodLogsHandler(c kube.Clients) mcp.ToolFunction {
 			return errResult, nil
 		}
 
-		opts := &corev1.PodLogOptions{
-			Container:  container,
-			Previous:   args.Previous,
-			Timestamps: timestamps,
-			TailLines:  args.TailLines,
-			// LimitBytes is deliberately never set: it truncates from the
-			// START of the stream, which is the opposite of a tail.
+		fetched, errResult := fetchPodLogs(ctx, cs, args.Context, args.Namespace, args.Pod, container, window)
+		if errResult != nil {
+			return errResult, nil
 		}
-		stream, err := cs.CoreV1().Pods(args.Namespace).GetLogs(args.Pod, opts).Stream(ctx)
-		if err != nil {
-			if args.Previous {
-				return mcp.ErrorResultf("failed to read previous logs for container %q of pod %s/%s on context %q (a pod that has never restarted has no previous container): %v",
-					container, args.Namespace, args.Pod, args.Context, err), nil
-			}
-			return mcp.ErrorResultf("failed to read logs for container %q of pod %s/%s on context %q: %v",
-				container, args.Namespace, args.Pod, args.Context, err), nil
-		}
-		defer stream.Close()
-
-		tb := newTailBuffer(maxSizeKiB)
-		if _, err := io.Copy(tb, stream); err != nil {
-			return mcp.ErrorResultf("failed while streaming logs for container %q of pod %s/%s: %v",
-				container, args.Namespace, args.Pod, err), nil
-		}
-		logs, truncated := tb.Tail()
 
 		out := podLogsOutput{
 			Context:       args.Context,
 			Namespace:     args.Namespace,
 			Pod:           args.Pod,
 			Container:     container,
-			Previous:      args.Previous,
-			Timestamps:    timestamps,
-			TailLines:     args.TailLines,
-			MaxSizeKiB:    maxSizeKiB,
-			Truncated:     truncated,
-			BytesReturned: len(logs),
-			BytesStreamed: tb.Total(),
-			Logs:          string(logs),
+			Previous:      window.Previous,
+			Timestamps:    window.Timestamps,
+			TailLines:     window.TailLines,
+			MaxSizeKiB:    window.MaxSizeKiB,
+			Truncated:     fetched.Truncated,
+			BytesReturned: fetched.BytesReturned,
+			BytesStreamed: fetched.BytesStreamed,
+			Logs:          string(fetched.Logs),
 		}
-
-		// Built by hand rather than through jsonResult: that helper's text
-		// block is the JSON encoding, which would escape every newline in the
-		// log and leave it unreadable.
-		var text strings.Builder
-		if truncated {
-			fmt.Fprintf(&text, "[truncated: showing the last %d bytes of %d streamed]\n", len(logs), tb.Total())
-		}
-		if len(logs) == 0 {
-			text.WriteString(fmt.Sprintf("[no log output from container %q of pod %s/%s]\n", container, args.Namespace, args.Pod))
-		}
-		text.Write(logs)
 
 		return &mcp.ToolCallResult{
 			Content: []mcp.Content{
-				mcp.Text(text.String()),
+				mcp.Text(logText(fetched, args.Namespace, args.Pod, container)),
 				mcp.ResourceLinkContent(podURI(args.Context, args.Namespace, args.Pod),
 					args.Pod, "Full Pod manifest", "application/json"),
 			},
 			StructuredContent: out,
 		}, nil
 	}
+}
+
+// logWindow is the resolved read-and-tail window shared by every tool that
+// returns container logs: kubectl_get_pod_logs, which is handed a pod, and the
+// plugin tools that find their own pod first.
+type logWindow struct {
+	TailLines  *int64
+	MaxSizeKiB *int
+	Previous   bool
+	Timestamps bool
+}
+
+// resolveLogWindow validates the four window arguments and applies their
+// defaults. Timestamps is a pointer because an omitted field must be
+// distinguishable from an explicit false, the default being true.
+func resolveLogWindow(tailLines *int64, maxSizeKiB *int, previous bool, timestamps *bool) (logWindow, *mcp.ToolCallResult) {
+	if tailLines != nil && *tailLines < 1 {
+		return logWindow{}, mcp.ErrorResultf("tail_lines must be at least 1, got %d: omit it for the whole retained log", *tailLines)
+	}
+	if maxSizeKiB != nil && (*maxSizeKiB < 1 || *maxSizeKiB > maxMaxSizeKiB) {
+		return logWindow{}, mcp.ErrorResultf("max_size_kib must be between 1 and %d, got %d", maxMaxSizeKiB, *maxSizeKiB)
+	}
+
+	// Neither bound given: fall back to the 256 KiB tail rather than handing
+	// back a whole log of unknown size.
+	if maxSizeKiB == nil && tailLines == nil {
+		d := defaultMaxSizeKiB
+		maxSizeKiB = &d
+	}
+
+	w := logWindow{TailLines: tailLines, MaxSizeKiB: maxSizeKiB, Previous: previous, Timestamps: true}
+	if timestamps != nil {
+		w.Timestamps = *timestamps
+	}
+	return w, nil
+}
+
+// logFetch is what streaming one container's log yielded. It deliberately does
+// not carry a JSON shape: each tool maps it into its own output struct, so the
+// two OutputSchemas stay independent of each other.
+type logFetch struct {
+	Truncated     bool
+	BytesReturned int
+	BytesStreamed int64
+	Logs          []byte
+}
+
+// fetchPodLogs streams one container's log subresource through a tailBuffer,
+// applying window. kubeContext is carried only to name the cluster in the
+// errors a model reads.
+func fetchPodLogs(ctx context.Context, cs kubernetes.Interface, kubeContext, namespace, pod, container string, w logWindow) (logFetch, *mcp.ToolCallResult) {
+	opts := &corev1.PodLogOptions{
+		Container:  container,
+		Previous:   w.Previous,
+		Timestamps: w.Timestamps,
+		TailLines:  w.TailLines,
+		// LimitBytes is deliberately never set: it truncates from the
+		// START of the stream, which is the opposite of a tail.
+	}
+	stream, err := cs.CoreV1().Pods(namespace).GetLogs(pod, opts).Stream(ctx)
+	if err != nil {
+		if w.Previous {
+			return logFetch{}, mcp.ErrorResultf("failed to read previous logs for container %q of pod %s/%s on context %q (a pod that has never restarted has no previous container): %v",
+				container, namespace, pod, kubeContext, err)
+		}
+		return logFetch{}, mcp.ErrorResultf("failed to read logs for container %q of pod %s/%s on context %q: %v",
+			container, namespace, pod, kubeContext, err)
+	}
+	defer stream.Close()
+
+	tb := newTailBuffer(w.MaxSizeKiB)
+	if _, err := io.Copy(tb, stream); err != nil {
+		return logFetch{}, mcp.ErrorResultf("failed while streaming logs for container %q of pod %s/%s: %v",
+			container, namespace, pod, err)
+	}
+	logs, truncated := tb.Tail()
+	return logFetch{
+		Truncated:     truncated,
+		BytesReturned: len(logs),
+		BytesStreamed: tb.Total(),
+		Logs:          logs,
+	}, nil
+}
+
+// logText renders the text Content block a log tool returns: any caller-supplied
+// banners, then the truncation banner, then the empty-log note, then the raw
+// bytes.
+//
+// Built by hand rather than through jsonResult because that helper's text block
+// is the JSON encoding, which would escape every newline in the log and leave
+// it unreadable.
+func logText(f logFetch, namespace, pod, container string, banners ...string) string {
+	var text strings.Builder
+	for _, b := range banners {
+		text.WriteString(b)
+		text.WriteString("\n")
+	}
+	if f.Truncated {
+		fmt.Fprintf(&text, "[truncated: showing the last %d bytes of %d streamed]\n", f.BytesReturned, f.BytesStreamed)
+	}
+	if len(f.Logs) == 0 {
+		fmt.Fprintf(&text, "[no log output from container %q of pod %s/%s]\n", container, namespace, pod)
+	}
+	text.Write(f.Logs)
+	return text.String()
 }
 
 // resolveContainer validates the requested container against the pod, or picks
