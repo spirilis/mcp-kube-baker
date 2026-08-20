@@ -1,0 +1,17 @@
+# mcp-kube-baker example configuration — stdio transport (default).
+#
+# This file is optional: run mcp-kube-baker with no --config and it defaults
+# to stdio + legacy compat enabled, with the kubeconfig taken from
+# $KUBECONFIG or ~/.kube/config.
+#
+# The kubeconfig path must point at a file external to this config; cluster
+# credentials are never inlined here. Omit it to fall back to $KUBECONFIG,
+# then ~/.kube/config (a --kubeconfig CLI flag overrides all of these).
+kubeconfig: /home/user/.kube/config
+
+server:
+  mode: stdio
+
+logging:
+  level: info    # info | debug | trace
+  format: text   # text | json

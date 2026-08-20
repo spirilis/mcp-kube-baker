@@ -1,0 +1,34 @@
+# mcp-kube-baker example configuration — Streamable HTTP transport, with the
+# optional extras: legacy MCP compatibility and GitHub OAuth (both off by
+# default; uncomment to enable).
+kubeconfig: /home/user/.kube/config
+
+server:
+  mode: http
+  http:
+    host: 127.0.0.1
+    port: 8080
+    # Requests with no Origin header (non-browser clients) are always allowed.
+    # Empty allowed_origins permits only localhost origins; "*" allows any.
+    #allowed_origins: ["*"]
+  # Serve pre-2026-07-28 MCP clients (initialize handshake + sessions) too:
+  #legacy_compat:
+  #  enabled: true
+  #  session_ttl: 30m
+
+# GitHub OAuth for the HTTP transport. When enabled, tool/resource responses
+# are marked cacheScope=private automatically.
+#auth:
+#  enabled: true
+#  issuer: https://mcp.example.com
+#  github:
+#    clientId: "your-github-oauth-app-client-id"
+#    clientSecret: "your-github-oauth-app-client-secret"
+#  storage:
+#    dbPath: /var/lib/mcp-kube-baker/oauth.db
+#  allowlist:
+#    users: ["your-github-login"]
+
+logging:
+  level: info
+  format: text
