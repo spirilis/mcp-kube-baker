@@ -675,3 +675,63 @@ ever turns out to differ, the skill is a second place to correct.
 
 Committed and released in tag `0.2.0` alongside Phase 10, which had been
 awaiting review in the same working tree.
+
+---
+
+## Phase 12 — generic-go-mcp v0.8.1: health/readiness probes on the HTTP listener
+
+Plan: `~/.claude/plans/update-this-library-for-enchanted-sundae.md` (approved 2026-08-21)
+
+v0.8.1's whole code delta over v0.8.0 is one additive field —
+`transport.HTTPTransportConfig.ExtraRoutes func(*http.ServeMux)` — so the version bump alone is a
+no-op. The hook exists (per its commit, `99e9443`) so an embedder can put a health or readiness
+probe on the transport's own listener, which `HTTPTransport` fully owns; this repo is exactly the
+Kubernetes-deployed server that had nowhere to put one.
+
+- [x] `go.mod` — `generic-go-mcp` v0.8.0 → **v0.8.1**. Only the `require` line moves; the library's
+      own go.mod is unchanged, so no transitive requirement shifted. `go mod tidy` dropped the stale
+      v0.8.0 go.sum rows.
+- [x] `internal/health` — new package. `Routes(mux *http.ServeMux)` is written with the hook's exact
+      signature so `main.go` assigns it by name, no closure. `GET /healthz` → `{"status":"healthy"}`,
+      `GET /readyz` → `{"status":"ready"}`, both `application/json`.
+- [x] `cmd/mcp-kube-baker/main.go` — `ExtraRoutes: health.Routes` on the `httpCfg` literal in the
+      `case "http":` block; the startup log line now carries `probes="/healthz /readyz"`. stdio and
+      unix are untouched — the hook is HTTP-only.
+- [x] `internal/health/health_test.go` — 200/body/content-type per probe, 405 on POST, 404 off-path,
+      plus a collision guard that re-registers `/mcp` and the six auth patterns on the same mux
+      after `Routes` (`http.ServeMux` panics on a duplicate, which is precisely the startup failure
+      the library's docs warn about).
+- [x] `README.md` + `config-http.yaml` — documented as always-on, unauthenticated, local-state-only.
+- [x] `go build ./... && go vet ./... && go test ./...` all clean.
+
+### Decisions
+
+- **Paths `/healthz` and `/readyz`**, not the `/health` and `/ready` of the library's doc example —
+  the `z` suffix is what kube-apiserver and every other component serve, so it reads as native to an
+  operator writing the Deployment.
+- **Readiness answers from local state, never dialing a cluster.** The kubeconfig is validated once
+  at startup and clientsets are lazy per context, so there is nothing remote to wait on — and since
+  this server is deliberately multi-cluster, a readiness probe tracking one API server would pull
+  the pod out of its Service while `kubectl_get_contexts` and every other context still answered
+  correctly. Liveness and readiness stay separate paths because a deployment expects them to be, not
+  because the answers can diverge.
+- **No config knob.** The endpoints disclose nothing (no context name, no cluster identity), which
+  is what makes always-on safe — and is required, since they sit outside the auth middleware, which
+  wraps `/mcp` alone. A probe carries no token.
+
+### Review — verified on the wire
+
+Ran the built binary with `mode: http` on 127.0.0.1:8080 against a synthetic kubeconfig:
+
+- `GET /healthz` → `200`, `Content-Type: application/json`, `Content-Length: 20`; `GET /readyz` →
+  `200`, length 18.
+- `HEAD /healthz` → `200` — Go's `GET` method pattern matches HEAD, so a `curl -I` HEALTHCHECK works.
+- `POST /healthz` → `405`; `GET /nope` → `404`. Routing outside the two probes is unchanged.
+- `POST /mcp` `tools/list` (with the `MCP-Protocol-Version`/`Mcp-Method` headers and `params._meta`)
+  still returned the full catalog alongside them, and the startup log showed
+  `msg="Starting MCP server in HTTP mode" host=127.0.0.1 port=8080 probes="/healthz /readyz"`.
+- stdio mode re-checked: a piped `tools/list` answered normally and shut down on EOF.
+
+Not verified against a live cluster or a real Deployment — the probes contact nothing, so there is
+nothing cluster-side for them to get wrong. This repo carries no Dockerfile or Kubernetes manifests
+yet; whenever those land, `/healthz` and `/readyz` are the probe targets to wire up.

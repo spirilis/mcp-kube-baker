@@ -314,6 +314,15 @@ Notes:
 
 - **Auth** (GitHub OAuth) applies to the HTTP transport only. When enabled,
   responses are marked `cacheScope: private` automatically.
+- **Health probes.** In `http` mode the server answers `GET /healthz` and
+  `GET /readyz` on the same host and port as `/mcp` — targets for a Kubernetes
+  Deployment's `httpGet` probes or a Docker `HEALTHCHECK`. There is no knob:
+  they are always on, and they are deliberately unauthenticated (a probe carries
+  no token) since the auth middleware wraps `/mcp` alone. Both answer from local
+  state and name no context or cluster. No cluster is contacted — the kubeconfig
+  is validated at startup and clientsets are built lazily, and one unreachable
+  cluster must not pull the pod out of its Service while every other context
+  still answers.
 - **Legacy compat** wraps the server in generic-go-mcp's `compat.Overlay`,
   restoring the `initialize` handshake and (on HTTP) `Mcp-Session-Id`
   sessions for 2025-11-25-and-earlier clients. The skills extension is

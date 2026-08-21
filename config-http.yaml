@@ -11,6 +11,10 @@ server:
     # Requests with no Origin header (non-browser clients) are always allowed.
     # Empty allowed_origins permits only localhost origins; "*" allows any.
     #allowed_origins: ["*"]
+    # This listener also answers GET /healthz and GET /readyz alongside /mcp,
+    # for Kubernetes probes or a Docker HEALTHCHECK. Always on, no knob, and
+    # unauthenticated even when auth is enabled below — a probe carries no
+    # token, and neither response names a context or cluster.
   # Serve pre-2026-07-28 MCP clients (initialize handshake + sessions) too:
   #legacy_compat:
   #  enabled: true

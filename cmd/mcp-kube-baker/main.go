@@ -19,6 +19,7 @@ import (
 	"github.com/spirilis/generic-go-mcp/transport"
 
 	"github.com/spirilis/mcp-kube-baker/internal/config"
+	"github.com/spirilis/mcp-kube-baker/internal/health"
 	"github.com/spirilis/mcp-kube-baker/internal/kube"
 	"github.com/spirilis/mcp-kube-baker/internal/resources"
 	"github.com/spirilis/mcp-kube-baker/internal/skills"
@@ -213,6 +214,11 @@ func main() {
 			Port:           cfg.Server.HTTP.Port,
 			AllowedOrigins: cfg.Server.HTTP.AllowedOrigins,
 			LegacySessions: legacySessions,
+			// Liveness/readiness probes on the same listener. The
+			// transport owns its mux, so this hook is the only place
+			// they can live; it runs before /mcp and the auth routes
+			// are registered.
+			ExtraRoutes: health.Routes,
 		}
 		// Conditional on purpose: assigning a nil *auth.AuthService
 		// unconditionally would store a typed nil in the AuthProvider
@@ -221,7 +227,8 @@ func main() {
 			httpCfg.AuthService = authService
 		}
 		trans = transport.NewHTTPTransport(httpCfg)
-		logging.Info("Starting MCP server in HTTP mode", "host", cfg.Server.HTTP.Host, "port", cfg.Server.HTTP.Port)
+		logging.Info("Starting MCP server in HTTP mode",
+			"host", cfg.Server.HTTP.Host, "port", cfg.Server.HTTP.Port, "probes", "/healthz /readyz")
 	case "unix":
 		// The UNIX transport's management convention: expose /name and /pid
 		// as concrete resources under the same custom scheme.
